@@ -24,6 +24,23 @@ jobs:
       GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
       GIT_TERMINAL_PROMPT: '0'
     steps:
+      - name: 显示出口 IP 并等待 GitLab 入口放行
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_ip=$(curl -4fsS --connect-timeout 5 --max-time 15 https://api.ipify.org)
+          printf '本次执行器公网 IPv4：%s\n' "$runner_ip"
+          # 保持同一次运行，防止重新执行后地址变化导致白名单失效。
+          deadline=$((SECONDS + 600))
+          until curl -4fsS --head --connect-timeout 3 --max-time 5 \
+            https://gitlab.yungu-inc.org/users/sign_in >/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo '等待入口放行超时，本次未执行代码同步。' >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo 'GitLab HTTPS 入口已连通，继续同步。'
       - name: 同步分支和标签并核对提交
         shell: bash
         run: |
