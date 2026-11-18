@@ -1,0 +1,78 @@
+name: 同步到 GitLab
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-gitlab
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+      TARGET_URL: https://gitlab.yungu-inc.org/yungu-app/test1.git
+      GH_TOKEN: ${{ github.token }}
+      GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      GIT_TERMINAL_PROMPT: '0'
+    steps:
+      - name: 同步分支和标签并核对提交
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GL_TOKEN" ]; then
+            echo '缺少 GITLAB_TOKEN，请先在仓库 Actions Secrets 中配置。' >&2
+            exit 1
+          fi
+
+          # 凭据通过临时认证脚本提供，避免写进仓库地址或 Git 配置。
+          auth_dir=$(mktemp -d)
+          trap 'rm -rf "$auth_dir"' EXIT
+          export GIT_ASKPASS="$auth_dir/askpass"
+          cat > "$GIT_ASKPASS" <<'SCRIPT'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*) printf '%s\n' "$AUTH_USER" ;;
+            *Password*) printf '%s\n' "$AUTH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SCRIPT
+          chmod 700 "$GIT_ASKPASS"
+
+          # 裸克隆获取全部分支和标签，也支持私有 GitHub 源仓库。
+          AUTH_USER=x-access-token AUTH_TOKEN="$GH_TOKEN" \
+            git -c credential.helper= clone --bare "$SOURCE_URL" source.git
+          cd source.git
+
+          # 遇到历史分歧时显式失败，避免覆盖目标独有提交；不删除目标分支。
+          export AUTH_USER=oauth2 AUTH_TOKEN="$GL_TOKEN"
+          git -c credential.helper= push --atomic "$TARGET_URL" \
+            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+
+          # 逐项核对源端分支、标签对应的提交，允许目标保留其他分支。
+          git for-each-ref --format='%(objectname) %(refname)' \
+            refs/heads refs/tags | LC_ALL=C sort > "$auth_dir/source-refs"
+          git -c credential.helper= ls-remote --refs "$TARGET_URL" \
+            'refs/heads/*' 'refs/tags/*' | awk '{print $1 " " $2}' | \
+            LC_ALL=C sort > "$auth_dir/target-refs"
+          if [ -s "$auth_dir/source-refs" ]; then
+            comm -23 "$auth_dir/source-refs" "$auth_dir/target-refs" > "$auth_dir/missing-refs"
+            if [ -s "$auth_dir/missing-refs" ]; then
+              echo '同步后分支或标签校验不一致：' >&2
+              cat "$auth_dir/missing-refs" >&2
+              exit 1
+            fi
+          else
+            echo '源仓库没有可同步的分支或标签。' >&2
+            exit 1
+          fi
+          echo '同步成功：源仓库全部分支、标签的对象 SHA 与 GitLab 一致。'
+          cat "$auth_dir/source-refs"
